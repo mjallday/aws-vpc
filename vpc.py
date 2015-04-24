@@ -23,13 +23,13 @@ Create:
 
 """
 
-from troposphere import Join, Output, FindInMap, Base64, If
+from troposphere import Join, Output, FindInMap, Base64, If, GetAtt
 from troposphere import Parameter, Ref, Tags, Template, ec2, autoscaling
 
 
 # TODO: dehardcode this shit
-REGION = 'us-west-2'
-AVAILABILITY_ZONES = ['a', 'b', 'c']
+REGION = 'us-east-1'
+AVAILABILITY_ZONES = ['a', 'b', 'e']
 SUBNET_BASE = '10.4'
 VPC_NAME = 'prod-vpc'
 
@@ -343,7 +343,8 @@ for zone in AVAILABILITY_ZONES:
     t.add_resource(ec2.Route(
         'worldwideroute' + zone,
         DestinationCidrBlock='0.0.0.0/0',
-        InstanceId=Ref('NAT' + zone),
+        NetworkInterfaceId=Ref('NATENI' + zone),
+        # InstanceId=Ref('NAT' + zone),
         RouteTableId=Ref('routingTable' + zone),
     ))
 
@@ -508,11 +509,26 @@ nat_sgrp = t.add_resource(ec2.SecurityGroup(
 ))
 
 
-for az in AVAILABILITY_ZONES:
+for index, az in enumerate(AVAILABILITY_ZONES):
     t.add_resource(ec2.EIP(
         'NATEIP' + az,
         Domain='vpc',
         InstanceId=Ref('NAT' + az)
+    ))
+
+    t.add_resource(ec2.NetworkInterface(
+        'NatEni' + az,
+        # Join('', ['NAT-ENI-', GetAtt(Ref('nat' + az), 'AvailabilityZone')]),
+        # Domain='vpc',
+        # InstanceId=Ref('NAT' + az),
+        PrivateIpAddress=SUBNET_BASE + '.' + str(index) + '.10',
+        SourceDestCheck=False,
+        GroupSet=[Ref(nat_sgrp), Ref(ssh_sgrp)],
+        SubnetId=Ref('nat' + az),
+        Tags=Tags(
+            Name='NATIPAddress',
+            role='nat',
+        )
     ))
 
     ec2_instance = t.add_resource(ec2.Instance(
@@ -521,8 +537,8 @@ for az in AVAILABILITY_ZONES:
         InstanceType=Ref('InstanceType'),
         KeyName=Ref('KeyName'),
         IamInstanceProfile=Ref('IAMRole'),
-        SubnetId=Ref('nat' + az),
-        SecurityGroupIds=[Ref(nat_sgrp), Ref(ssh_sgrp)],
+        # SubnetId=Ref('nat' + az),
+        # SecurityGroupIds=[Ref(nat_sgrp), Ref(ssh_sgrp)],
         SourceDestCheck=False,
         Tags=Tags(
             Name='NAT' + az,
@@ -537,9 +553,43 @@ for az in AVAILABILITY_ZONES:
             ' --stack ', Ref('AWS::StackName'),
             ' --resource ', 'NAT' + az,
             ' --verbose', '\n',
+            '''
+function log { logger -t "vpc" -- $1; }
+
+log "Beginning Port Address Translator (PAT) configuration..."
+log "Determining the MAC address on eth0..."
+
+ETH0_MAC=$(cat /sys/class/net/eth0/address) ||
+    die "Unable to determine MAC address on eth0."
+log "Found MAC ${ETH0_MAC} for eth0."
+
+VPC_CIDR_URI="http://169.254.169.254/latest/meta-data/network/interfaces/macs/${ETH0_MAC}/vpc-ipv4-cidr-block"
+log "Metadata location for vpc ipv4 range: ${VPC_CIDR_URI}"
+
+VPC_CIDR_RANGE=$(curl --retry 3 --silent --fail ${VPC_CIDR_URI})
+if [ $? -ne 0 ]; then
+   log "Unable to retrive VPC CIDR range from meta-data, using 0.0.0.0/0 instead. PAT may be insecure!"
+   VPC_CIDR_RANGE="0.0.0.0/0"
+else
+   log "Retrieved VPC CIDR range ${VPC_CIDR_RANGE} from meta-data."
+fi
+
+sysctl -q -w net.ipv4.ip_forward=1 net.ipv4.conf.eth0.send_redirects=0 && (
+   iptables -t nat -C POSTROUTING -o eth0 -s ${VPC_CIDR_RANGE} -j MASQUERADE 2> /dev/null ||
+   iptables -t nat -A POSTROUTING -o eth0 -s ${VPC_CIDR_RANGE} -j MASQUERADE ) ||
+       die
+
+sysctl net.ipv4.ip_forward net.ipv4.conf.eth0.send_redirects | log
+iptables -n -t nat -L POSTROUTING | log
+
+            ''',
             'result=$?', '\n',
         ])),
         Metadata={},
+        NetworkInterfaces=[ec2.NetworkInterfaceProperty(
+            DeviceIndex='0',
+            NetworkInterfaceId='NatEni' + az,
+        )]
     ))
 
 
